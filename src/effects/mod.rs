@@ -1,149 +1,99 @@
-use crate::arena::Handle;
+use crate::completion::CompletionHandle;
+use crate::io::Operation;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RuntimeMessage<M> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum RuntimeMessage {
     Init,
-    User(M),
+    IoCompleted(CompletionHandle),
+    Shutdown,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Action<M> {
-    Send {
-        target: Handle,
-        message: RuntimeMessage<M>,
+pub enum Effect {
+    Submit {
+        completion: CompletionHandle,
+        op: Operation,
     },
-    SendSelf {
-        message: M,
+    Cancel {
+        completion: CompletionHandle,
     },
     DestroySelf,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Wait<M> {
-    Accept {
-        listener: u32,
-        completion: RuntimeMessage<M>,
-    },
-    Recv {
-        source: u32,
-        completion: RuntimeMessage<M>,
-    },
-    Write {
-        sink: u32,
-        completion: RuntimeMessage<M>,
-    },
-    Timer {
-        ticks: u32,
-        completion: RuntimeMessage<M>,
-    },
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EffectsError {
-    ActionsFull,
-    TurnSealed,
-    WaitAlreadySet,
+    Full,
 }
 
-pub struct TurnEffects<M> {
-    actions: Vec<Action<M>>,
-    max_actions: usize,
-    wait: Option<Wait<M>>,
-    sealed: bool,
+pub struct TurnEffects {
+    effects: Vec<Effect>,
+    max_effects: usize,
 }
 
-impl<M> TurnEffects<M> {
-    pub fn with_capacity(max_actions: usize) -> Self {
+impl TurnEffects {
+    pub fn with_capacity(max_effects: usize) -> Self {
         Self {
-            actions: Vec::with_capacity(max_actions),
-            max_actions,
-            wait: None,
-            sealed: false,
+            effects: Vec::with_capacity(max_effects),
+            max_effects,
         }
     }
 
     pub fn reset(&mut self) {
-        self.actions.clear();
-        self.wait = None;
-        self.sealed = false;
+        self.effects.clear();
     }
 
-    pub fn send(&mut self, target: Handle, message: M) -> Result<(), EffectsError> {
-        self.push_action(Action::Send {
-            target,
-            message: RuntimeMessage::User(message),
-        })
+    pub fn submit(
+        &mut self,
+        completion: CompletionHandle,
+        op: Operation,
+    ) -> Result<(), EffectsError> {
+        self.push(Effect::Submit { completion, op })
     }
 
-    pub fn send_self(&mut self, message: M) -> Result<(), EffectsError> {
-        self.push_action(Action::SendSelf { message })
+    pub fn cancel(&mut self, completion: CompletionHandle) -> Result<(), EffectsError> {
+        self.push(Effect::Cancel { completion })
     }
 
     pub fn destroy_self(&mut self) -> Result<(), EffectsError> {
-        self.push_action(Action::DestroySelf)
+        self.push(Effect::DestroySelf)
     }
 
-    pub fn wait_accept(&mut self, listener: u32, completion: M) -> Result<(), EffectsError> {
-        self.set_wait(Wait::Accept {
-            listener,
-            completion: RuntimeMessage::User(completion),
-        })
-    }
-
-    pub fn wait_recv(&mut self, source: u32, completion: M) -> Result<(), EffectsError> {
-        self.set_wait(Wait::Recv {
-            source,
-            completion: RuntimeMessage::User(completion),
-        })
-    }
-
-    pub fn wait_write(&mut self, sink: u32, completion: M) -> Result<(), EffectsError> {
-        self.set_wait(Wait::Write {
-            sink,
-            completion: RuntimeMessage::User(completion),
-        })
-    }
-
-    pub fn wait_timer(&mut self, ticks: u32, completion: M) -> Result<(), EffectsError> {
-        self.set_wait(Wait::Timer {
-            ticks,
-            completion: RuntimeMessage::User(completion),
-        })
-    }
-
-    pub fn swap_actions(&mut self, scratch: &mut Vec<Action<M>>) {
+    pub fn swap_effects(&mut self, scratch: &mut Vec<Effect>) {
         scratch.clear();
-        std::mem::swap(&mut self.actions, scratch);
+        std::mem::swap(&mut self.effects, scratch);
     }
 
-    pub fn take_wait(&mut self) -> Option<Wait<M>> {
-        self.wait.take()
-    }
-
-    fn push_action(&mut self, action: Action<M>) -> Result<(), EffectsError> {
-        if self.sealed {
-            return Err(EffectsError::TurnSealed);
+    fn push(&mut self, effect: Effect) -> Result<(), EffectsError> {
+        if self.effects.len() == self.max_effects {
+            return Err(EffectsError::Full);
         }
 
-        if self.actions.len() == self.max_actions {
-            return Err(EffectsError::ActionsFull);
-        }
-
-        self.actions.push(action);
+        self.effects.push(effect);
         Ok(())
     }
+}
 
-    fn set_wait(&mut self, wait: Wait<M>) -> Result<(), EffectsError> {
-        if self.sealed {
-            return Err(EffectsError::TurnSealed);
-        }
+#[cfg(test)]
+mod tests {
+    use super::{Effect, EffectsError, TurnEffects};
+    use crate::completion::CompletionHandle;
+    use crate::io::{Operation, TimerOp};
 
-        if self.wait.is_some() {
-            return Err(EffectsError::WaitAlreadySet);
-        }
+    #[test]
+    fn effects_are_bounded_and_preserve_order() {
+        let mut effects = TurnEffects::with_capacity(2);
+        let completion = CompletionHandle::INVALID;
 
-        self.wait = Some(wait);
-        self.sealed = true;
-        Ok(())
+        effects
+            .submit(completion, Operation::Timer(TimerOp { ticks: 1 }))
+            .unwrap();
+        effects.cancel(completion).unwrap();
+        assert_eq!(effects.destroy_self(), Err(EffectsError::Full));
+
+        let mut scratch = Vec::with_capacity(2);
+        effects.swap_effects(&mut scratch);
+        assert!(matches!(scratch[0], Effect::Submit { .. }));
+        assert!(matches!(scratch[1], Effect::Cancel { .. }));
     }
 }

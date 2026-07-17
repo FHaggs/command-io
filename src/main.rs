@@ -1,67 +1,133 @@
 mod arena;
+mod completion;
 mod effects;
 mod io;
 mod runtime;
 
+use completion::CompletionHandle;
 use effects::{RuntimeMessage, TurnEffects};
-use runtime::{Isolate, RuntimeError, Scheduler};
+use io::{FakeIoDriver, IoResult, Operation, RawFdLike, RecvOp, SendOp};
+use runtime::{IoContext, IoLoop, Isolate, RuntimeError, Server};
 
-#[derive(Debug)]
-struct DemoIsolate {
-    remaining_ticks: u8,
+enum Phase {
+    Reading,
+    Writing,
+    Closing,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum DemoMessage {
-    Tick,
-    TearDown,
+struct EchoConnection {
+    fd: RawFdLike,
+    phase: Phase,
+    recv: CompletionHandle,
+    send: CompletionHandle,
 }
 
-impl Isolate for DemoIsolate {
-    type Message = DemoMessage;
+impl EchoConnection {
+    fn new(fd: RawFdLike) -> Self {
+        Self {
+            fd,
+            phase: Phase::Reading,
+            recv: CompletionHandle::INVALID,
+            send: CompletionHandle::INVALID,
+        }
+    }
 
+    fn submit_recv(&self, effects: &mut TurnEffects) -> Result<(), RuntimeError> {
+        effects.submit(
+            self.recv,
+            Operation::Recv(RecvOp {
+                fd: self.fd,
+                buf: vec![0; 4096],
+                flags: 0,
+            }),
+        )?;
+        Ok(())
+    }
+
+    fn submit_send(&self, buf: Vec<u8>, effects: &mut TurnEffects) -> Result<(), RuntimeError> {
+        effects.submit(
+            self.send,
+            Operation::Send(SendOp {
+                fd: self.fd,
+                buf,
+                flags: 0,
+            }),
+        )?;
+        Ok(())
+    }
+}
+
+impl Isolate for EchoConnection {
     fn handle(
         &mut self,
-        msg: RuntimeMessage<Self::Message>,
-        effects: &mut TurnEffects<Self::Message>,
+        msg: RuntimeMessage,
+        io: &mut IoContext<'_>,
+        effects: &mut TurnEffects,
     ) -> Result<(), RuntimeError> {
         match msg {
             RuntimeMessage::Init => {
-                println!("init: scheduling first tick: step by 2");
-                let _ = effects.send_self(DemoMessage::Tick);
-                effects.send_self(DemoMessage::Tick)?;
+                self.recv = io.acquire().expect("completion arena full");
+                self.send = io.acquire().expect("completion arena full");
+                self.submit_recv(effects)?;
             }
-            RuntimeMessage::User(DemoMessage::Tick) => {
-                if self.remaining_ticks == 0 {
-                    return Ok(());
+            RuntimeMessage::IoCompleted(completion) if completion == self.recv => {
+                match io.take_result(completion) {
+                    Some(IoResult::Recv(Ok(bytes))) if bytes.is_empty() => {
+                        self.phase = Phase::Closing;
+                        effects.destroy_self()?;
+                    }
+                    Some(IoResult::Recv(Ok(bytes))) => {
+                        self.phase = Phase::Writing;
+                        self.submit_send(bytes, effects)?;
+                    }
+                    Some(IoResult::Recv(Err(_))) | Some(IoResult::Cancelled) => {
+                        self.phase = Phase::Closing;
+                        effects.destroy_self()?;
+                    }
+                    Some(_) => unreachable!("recv completion had the wrong result kind"),
+                    None => unreachable!("recv completion arrived without a result"),
                 }
-                self.remaining_ticks -= 1;
-                println!("tick: remaining={}", self.remaining_ticks);
-
-                if self.remaining_ticks == 0 {
-                    effects.wait_accept(99, DemoMessage::TearDown)?;
-                } else {
-                    effects.send_self(DemoMessage::Tick)?;
+            }
+            RuntimeMessage::IoCompleted(completion) if completion == self.send => {
+                match io.take_result(completion) {
+                    Some(IoResult::Send(Ok(_))) => {
+                        self.phase = Phase::Reading;
+                        self.submit_recv(effects)?;
+                    }
+                    Some(IoResult::Send(Err(_))) | Some(IoResult::Cancelled) => {
+                        self.phase = Phase::Closing;
+                        effects.destroy_self()?;
+                    }
+                    Some(_) => unreachable!("send completion had the wrong result kind"),
+                    None => unreachable!("send completion arrived without a result"),
                 }
             }
-            RuntimeMessage::User(DemoMessage::TearDown) => {
-                println!("tear down: shutting down");
-                effects.destroy_self()?;
-            }
+            RuntimeMessage::IoCompleted(_) => {}
+            RuntimeMessage::Shutdown => effects.destroy_self()?,
         }
+        Ok(())
+    }
 
+    fn destroy(
+        &mut self,
+        _io: &mut IoContext<'_>,
+        effects: &mut TurnEffects,
+    ) -> Result<(), RuntimeError> {
+        effects.cancel(self.recv)?;
+        effects.cancel(self.send)?;
         Ok(())
     }
 }
 
 fn main() {
-    let mut scheduler = Scheduler::new(16, 64, 8);
-    let isolate = DemoIsolate {
-        remaining_ticks: 5,
-    };
+    let mut server = Server::new(16, 64, 8);
+    let mut io_loop = IoLoop::new(FakeIoDriver::new(64), 32);
 
-    let _handle = scheduler.spawn(isolate).expect("spawn demo isolate");
-
-    let processed = scheduler.run_until_idle().expect("runtime should drain queue");
-    println!("processed {processed} work items");
+    server
+        .spawn(EchoConnection::new(7))
+        .expect("spawn echo connection");
+    let processed = server
+        .run_until_idle(&mut io_loop)
+        .expect("runtime should drain echo connection");
+    println!("processed {processed} isolate turns");
 }

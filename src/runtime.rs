@@ -1,26 +1,34 @@
 use std::collections::VecDeque;
 
 use crate::arena::{Arena, ArenaError, Handle};
-use crate::effects::{Action, EffectsError, RuntimeMessage, TurnEffects, Wait};
-use crate::io::{FakeWaitBackend, WaitBackend};
+use crate::completion::{CompletionArena, CompletionError, CompletionHandle, CompletionState};
+use crate::effects::{Effect, EffectsError, RuntimeMessage, TurnEffects};
+use crate::io::{DriverCompletion, IoDriver, IoError, IoResult, Operation};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Envelope<M> {
-    pub target: Handle,
-    pub message: RuntimeMessage<M>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Envelope {
+    target: Handle,
+    message: RuntimeMessage,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RuntimeError {
     Arena(ArenaError),
+    Completion(CompletionError),
     Effects(EffectsError),
+    Io(IoError),
     QueueFull,
-    WaitQueueFull,
 }
 
 impl From<ArenaError> for RuntimeError {
     fn from(value: ArenaError) -> Self {
         Self::Arena(value)
+    }
+}
+
+impl From<CompletionError> for RuntimeError {
+    fn from(value: CompletionError) -> Self {
+        Self::Completion(value)
     }
 }
 
@@ -30,13 +38,44 @@ impl From<EffectsError> for RuntimeError {
     }
 }
 
-pub trait Isolate {
-    type Message;
+impl From<IoError> for RuntimeError {
+    fn from(value: IoError) -> Self {
+        Self::Io(value)
+    }
+}
 
+pub struct IoContext<'a> {
+    completions: &'a mut CompletionArena<IoResult>,
+    owner: Handle,
+}
+
+impl IoContext<'_> {
+    pub fn acquire(&mut self) -> Option<CompletionHandle> {
+        self.completions.acquire(self.owner).ok()
+    }
+
+    #[allow(dead_code)]
+    pub fn release(&mut self, completion: CompletionHandle) -> Result<(), CompletionError> {
+        self.completions.release(self.owner, completion)
+    }
+
+    pub fn take_result(&mut self, completion: CompletionHandle) -> Option<IoResult> {
+        self.completions.take_result(self.owner, completion).ok()
+    }
+}
+
+pub trait Isolate {
     fn handle(
         &mut self,
-        msg: RuntimeMessage<Self::Message>,
-        effects: &mut TurnEffects<Self::Message>,
+        msg: RuntimeMessage,
+        io: &mut IoContext<'_>,
+        effects: &mut TurnEffects,
+    ) -> Result<(), RuntimeError>;
+
+    fn destroy(
+        &mut self,
+        io: &mut IoContext<'_>,
+        effects: &mut TurnEffects,
     ) -> Result<(), RuntimeError>;
 }
 
@@ -44,399 +83,436 @@ pub trait Isolate {
 pub enum StepResult {
     Idle,
     ProcessedOne,
+    AdvancedIo,
     DroppedInvalid,
-    AdvancedWaits,
 }
 
-pub struct Scheduler<I, B>
+pub struct IoLoop<D> {
+    driver: D,
+    completions: CompletionArena<IoResult>,
+    completed: Vec<DriverCompletion>,
+    ready: VecDeque<CompletionHandle>,
+    ready_capacity: usize,
+}
+
+impl<D> IoLoop<D>
 where
-    I: Isolate,
-    B: WaitBackend<I::Message>,
+    D: IoDriver,
 {
-    arena: Arena<I>,
-    queue: VecDeque<Envelope<I::Message>>,
-    queue_capacity: usize,
-    effects: TurnEffects<I::Message>,
-    action_scratch: Vec<Action<I::Message>>,
-    interpreter: EffectInterpreter,
-    waits: B,
-}
+    pub fn new(driver: D, completion_capacity: usize) -> Self {
+        Self {
+            driver,
+            completions: CompletionArena::with_capacity(completion_capacity),
+            completed: Vec::with_capacity(completion_capacity),
+            ready: VecDeque::with_capacity(completion_capacity),
+            ready_capacity: completion_capacity,
+        }
+    }
 
-pub struct EffectInterpreter;
+    pub fn step(&mut self) -> Result<bool, RuntimeError> {
+        self.completed.clear();
+        let available = self.ready_capacity.saturating_sub(self.ready.len());
+        let progressed = self.driver.step(available, &mut self.completed)?;
 
-impl EffectInterpreter {
-    fn interpret_turn<I, B>(
-        &mut self,
-        arena: &mut Arena<I>,
-        queue: &mut VecDeque<Envelope<I::Message>>,
-        queue_capacity: usize,
-        waits: &mut B,
-        current: Handle,
-        actions: &mut Vec<Action<I::Message>>,
-        wait: Option<Wait<I::Message>>,
-    ) -> Result<(), RuntimeError>
-    where
-        I: Isolate,
-        B: WaitBackend<I::Message>,
-    {
-        for action in actions.drain(..) {
-            match action {
-                Action::Send { target, message } => {
-                    enqueue_envelope(queue, queue_capacity, target, message)?;
-                }
-                Action::SendSelf { message } => {
-                    enqueue_envelope(queue, queue_capacity, current, RuntimeMessage::User(message))?;
-                }
-                Action::DestroySelf => {
-                    if arena.contains(current) {
-                        let _ = arena.remove(current)?;
-                    }
-                }
+        for DriverCompletion { completion, result } in self.completed.drain(..) {
+            let owner = self.completions.owner(completion)?;
+            let state = self.completions.state(completion)?;
+            self.completions.complete(completion, result)?;
+
+            if state == CompletionState::Cancelling {
+                self.completions.release(owner, completion)?;
+            } else {
+                debug_assert_eq!(state, CompletionState::Submitted);
+                self.ready.push_back(completion);
             }
         }
 
-        if let Some(wait) = wait {
-            waits.submit(current, wait)?;
-        }
+        Ok(progressed)
+    }
 
+    pub fn has_pending(&self) -> bool {
+        self.driver.has_pending() || !self.ready.is_empty()
+    }
+
+    fn submit(
+        &mut self,
+        owner: Handle,
+        completion: CompletionHandle,
+        op: Operation,
+    ) -> Result<(), RuntimeError> {
+        self.completions.submit(owner, completion)?;
+        self.driver.submit(completion, op)?;
         Ok(())
     }
-}
 
-impl<I> Scheduler<I, FakeWaitBackend<I::Message>>
-where
-    I: Isolate,
-{
-    pub fn new(arena_capacity: usize, queue_capacity: usize, action_capacity: usize) -> Self {
-        Self::new_with_backend(
-            arena_capacity,
-            queue_capacity,
-            action_capacity,
-            FakeWaitBackend::new(queue_capacity),
-        )
+    fn cancel(&mut self, owner: Handle, completion: CompletionHandle) -> Result<(), RuntimeError> {
+        match self.completions.begin_cancel(owner, completion)? {
+            CompletionState::Idle | CompletionState::Ready => {
+                self.completions.release(owner, completion)?;
+            }
+            CompletionState::Cancelling => {
+                self.driver.cancel(completion)?;
+            }
+            CompletionState::Submitted => unreachable!("begin_cancel advances submitted slots"),
+        }
+        Ok(())
+    }
+
+    fn pop_ready(&mut self) -> Option<CompletionHandle> {
+        self.ready.pop_front()
+    }
+
+    fn owner(&self, completion: CompletionHandle) -> Result<Handle, CompletionError> {
+        self.completions.owner(completion)
+    }
+
+    fn has_owner(&self, owner: Handle) -> bool {
+        self.completions.has_owner(owner)
     }
 }
 
-impl<I, B> Scheduler<I, B>
+struct IsolateSlot<I> {
+    isolate: I,
+    destroying: bool,
+}
+
+pub struct Server<I>
 where
     I: Isolate,
-    B: WaitBackend<I::Message>,
 {
-    pub fn new_with_backend(
-        arena_capacity: usize,
-        queue_capacity: usize,
-        action_capacity: usize,
-        waits: B,
-    ) -> Self {
+    arena: Arena<IsolateSlot<I>>,
+    queue: VecDeque<Envelope>,
+    queue_capacity: usize,
+    effects: TurnEffects,
+    effect_scratch: Vec<Effect>,
+    destroying: Vec<Handle>,
+}
+
+impl<I> Server<I>
+where
+    I: Isolate,
+{
+    pub fn new(isolate_capacity: usize, queue_capacity: usize, effect_capacity: usize) -> Self {
         Self {
-            arena: Arena::with_capacity(arena_capacity),
+            arena: Arena::with_capacity(isolate_capacity),
             queue: VecDeque::with_capacity(queue_capacity),
             queue_capacity,
-            effects: TurnEffects::with_capacity(action_capacity),
-            action_scratch: Vec::with_capacity(action_capacity),
-            interpreter: EffectInterpreter,
-            waits,
+            effects: TurnEffects::with_capacity(effect_capacity),
+            effect_scratch: Vec::with_capacity(effect_capacity),
+            destroying: Vec::with_capacity(isolate_capacity),
         }
     }
 
     pub fn spawn(&mut self, isolate: I) -> Result<Handle, RuntimeError> {
-        let handle = self.arena.insert(isolate)?;
-
-        if let Err(error) = self.enqueue_runtime(handle, RuntimeMessage::Init) {
+        let handle = self.arena.insert(IsolateSlot {
+            isolate,
+            destroying: false,
+        })?;
+        if let Err(error) = self.enqueue(handle, RuntimeMessage::Init) {
             let _ = self.arena.remove(handle);
             return Err(error);
         }
-
         Ok(handle)
     }
 
-    pub fn enqueue(&mut self, target: Handle, message: I::Message) -> Result<(), RuntimeError> {
-        self.enqueue_runtime(target, RuntimeMessage::User(message))
+    #[allow(dead_code)]
+    pub fn shutdown(&mut self, target: Handle) -> Result<(), RuntimeError> {
+        self.enqueue(target, RuntimeMessage::Shutdown)
     }
 
-    pub fn enqueue_runtime(
-        &mut self,
-        target: Handle,
-        message: RuntimeMessage<I::Message>,
-    ) -> Result<(), RuntimeError> {
-        enqueue_envelope(&mut self.queue, self.queue_capacity, target, message)
-    }
+    pub fn step<D>(&mut self, io: &mut IoLoop<D>) -> Result<StepResult, RuntimeError>
+    where
+        D: IoDriver,
+    {
+        self.finalize_destroyed(io)?;
+        let routed = self.route_ready(io)?;
 
-    pub fn run_once(&mut self) -> Result<StepResult, RuntimeError> {
-        let wait_progress = self.waits.poll(&mut self.queue, self.queue_capacity)?;
         let Some(envelope) = self.queue.pop_front() else {
-            return if wait_progress || self.waits.has_pending() {
-                Ok(StepResult::AdvancedWaits)
+            return if routed || io.has_pending() {
+                Ok(StepResult::AdvancedIo)
             } else {
                 Ok(StepResult::Idle)
             };
         };
 
-        if !self.arena.contains(envelope.target) {
+        let Some(slot) = self.arena.get_mut(envelope.target) else {
+            return Ok(StepResult::DroppedInvalid);
+        };
+        if slot.destroying {
             return Ok(StepResult::DroppedInvalid);
         }
 
         self.effects.reset();
         {
-            let isolate = self
-                .arena
-                .get_mut(envelope.target)
-                .ok_or(RuntimeError::Arena(ArenaError::InvalidHandle))?;
-            isolate.handle(envelope.message, &mut self.effects)?;
+            let mut context = IoContext {
+                completions: &mut io.completions,
+                owner: envelope.target,
+            };
+            slot.isolate
+                .handle(envelope.message, &mut context, &mut self.effects)?;
         }
 
-        self.effects.swap_actions(&mut self.action_scratch);
-        let wait = self.effects.take_wait();
-        self.interpreter.interpret_turn(
-            &mut self.arena,
-            &mut self.queue,
-            self.queue_capacity,
-            &mut self.waits,
-            envelope.target,
-            &mut self.action_scratch,
-            wait,
-        )?;
+        self.effects.swap_effects(&mut self.effect_scratch);
+        let destroy_requested = self.interpret_effects(io, envelope.target)?;
+        if destroy_requested {
+            self.start_destroy(io, envelope.target)?;
+        }
+        self.finalize_destroyed(io)?;
 
         Ok(StepResult::ProcessedOne)
     }
 
-    pub fn run_until_idle(&mut self) -> Result<usize, RuntimeError> {
+    pub fn run_until_idle<D>(&mut self, io: &mut IoLoop<D>) -> Result<usize, RuntimeError>
+    where
+        D: IoDriver,
+    {
         let mut processed = 0;
-
         loop {
-            match self.run_once()? {
+            match self.step(io)? {
                 StepResult::Idle => return Ok(processed),
                 StepResult::ProcessedOne => processed += 1,
-                StepResult::DroppedInvalid | StepResult::AdvancedWaits => {}
+                StepResult::AdvancedIo | StepResult::DroppedInvalid => {}
             }
+            io.step()?;
         }
     }
 
-    pub fn queue_len(&self) -> usize {
-        self.queue.len()
-    }
-
+    #[allow(dead_code)]
     pub fn isolate_count(&self) -> usize {
         self.arena.len()
     }
 
-    pub fn isolate_mut(&mut self, handle: Handle) -> Option<&mut I> {
-        self.arena.get_mut(handle)
-    }
-}
-
-fn enqueue_envelope<M>(
-    queue: &mut VecDeque<Envelope<M>>,
-    queue_capacity: usize,
-    target: Handle,
-    message: RuntimeMessage<M>,
-) -> Result<(), RuntimeError> {
-    if queue.len() == queue_capacity {
-        return Err(RuntimeError::QueueFull);
+    fn enqueue(&mut self, target: Handle, message: RuntimeMessage) -> Result<(), RuntimeError> {
+        if self.queue.len() == self.queue_capacity {
+            return Err(RuntimeError::QueueFull);
+        }
+        self.queue.push_back(Envelope { target, message });
+        Ok(())
     }
 
-    queue.push_back(Envelope { target, message });
-    Ok(())
+    fn route_ready<D>(&mut self, io: &mut IoLoop<D>) -> Result<bool, RuntimeError>
+    where
+        D: IoDriver,
+    {
+        let mut routed = false;
+        while self.queue.len() < self.queue_capacity {
+            let Some(completion) = io.pop_ready() else {
+                break;
+            };
+            let Ok(owner) = io.owner(completion) else {
+                continue;
+            };
+            self.queue.push_back(Envelope {
+                target: owner,
+                message: RuntimeMessage::IoCompleted(completion),
+            });
+            routed = true;
+        }
+        Ok(routed)
+    }
+
+    fn interpret_effects<D>(
+        &mut self,
+        io: &mut IoLoop<D>,
+        owner: Handle,
+    ) -> Result<bool, RuntimeError>
+    where
+        D: IoDriver,
+    {
+        let submit_count = self
+            .effect_scratch
+            .iter()
+            .filter(|effect| matches!(effect, Effect::Submit { .. }))
+            .count();
+        if !io.driver.can_submit(submit_count) {
+            return Err(RuntimeError::Io(IoError::DriverFull));
+        }
+
+        let mut destroy_requested = false;
+        for effect in self.effect_scratch.drain(..) {
+            match effect {
+                Effect::Submit { completion, op } => io.submit(owner, completion, op)?,
+                Effect::Cancel { completion } => io.cancel(owner, completion)?,
+                Effect::DestroySelf => destroy_requested = true,
+            }
+        }
+        Ok(destroy_requested)
+    }
+
+    fn start_destroy<D>(&mut self, io: &mut IoLoop<D>, owner: Handle) -> Result<(), RuntimeError>
+    where
+        D: IoDriver,
+    {
+        let Some(slot) = self.arena.get_mut(owner) else {
+            return Ok(());
+        };
+        if slot.destroying {
+            return Ok(());
+        }
+        slot.destroying = true;
+
+        self.effects.reset();
+        {
+            let mut context = IoContext {
+                completions: &mut io.completions,
+                owner,
+            };
+            slot.isolate.destroy(&mut context, &mut self.effects)?;
+        }
+        self.effects.swap_effects(&mut self.effect_scratch);
+        let destroy_requested = self.interpret_effects(io, owner)?;
+        debug_assert!(
+            !destroy_requested,
+            "destroy must not request destruction again"
+        );
+        self.destroying.push(owner);
+        Ok(())
+    }
+
+    fn finalize_destroyed<D>(&mut self, io: &IoLoop<D>) -> Result<(), RuntimeError>
+    where
+        D: IoDriver,
+    {
+        let mut index = 0;
+        while index < self.destroying.len() {
+            let owner = self.destroying[index];
+            if io.has_owner(owner) {
+                index += 1;
+                continue;
+            }
+            if self.arena.contains(owner) {
+                let _ = self.arena.remove(owner)?;
+            }
+            self.destroying.swap_remove(index);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Isolate, RuntimeError, Scheduler, StepResult};
-    use crate::effects::{EffectsError, RuntimeMessage, TurnEffects};
+    use std::cell::Cell;
+    use std::rc::Rc;
 
-    #[derive(Debug)]
-    struct Countdown {
-        remaining: u8,
+    use super::{IoContext, IoLoop, Isolate, RuntimeError, Server};
+    use crate::completion::CompletionHandle;
+    use crate::effects::{RuntimeMessage, TurnEffects};
+    use crate::io::{FakeIoDriver, IoResult, Operation, TimerOp};
+
+    struct TimerOnce {
+        timer: CompletionHandle,
+        completed: bool,
     }
 
-    #[derive(Debug)]
-    struct Relay {
-        peer: Option<crate::arena::Handle>,
-        seen_ping: bool,
-        seen_pong: bool,
-    }
-
-    #[derive(Debug)]
-    struct AcceptOnce {
-        accepted: bool,
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum Msg {
-        Tick,
-        Ping,
-        Pong,
-        Accepted,
-    }
-
-    impl Isolate for Countdown {
-        type Message = Msg;
-
+    impl Isolate for TimerOnce {
         fn handle(
             &mut self,
-            msg: RuntimeMessage<Self::Message>,
-            effects: &mut TurnEffects<Self::Message>,
+            msg: RuntimeMessage,
+            io: &mut IoContext<'_>,
+            effects: &mut TurnEffects,
         ) -> Result<(), RuntimeError> {
             match msg {
                 RuntimeMessage::Init => {
-                    effects.send_self(Msg::Tick)?;
+                    self.timer = io.acquire().expect("completion capacity");
+                    effects.submit(self.timer, Operation::Timer(TimerOp { ticks: 1 }))?;
                 }
-                RuntimeMessage::User(Msg::Tick) => {
-                    self.remaining -= 1;
-
-                    if self.remaining == 0 {
-                        effects.destroy_self()?;
-                    } else {
-                        effects.send_self(Msg::Tick)?;
-                    }
-                }
-                RuntimeMessage::User(Msg::Ping)
-                | RuntimeMessage::User(Msg::Pong)
-                | RuntimeMessage::User(Msg::Accepted) => {
-                    unreachable!("countdown only processes ticks")
-                }
-            }
-
-            Ok(())
-        }
-    }
-
-    impl Isolate for Relay {
-        type Message = Msg;
-
-        fn handle(
-            &mut self,
-            msg: RuntimeMessage<Self::Message>,
-            effects: &mut TurnEffects<Self::Message>,
-        ) -> Result<(), RuntimeError> {
-            match msg {
-                RuntimeMessage::Init => {}
-                RuntimeMessage::User(Msg::Ping) => {
-                    self.seen_ping = true;
-                    let peer = self.peer.expect("peer handle must be assigned");
-                    effects.send(peer, Msg::Pong)?;
-                }
-                RuntimeMessage::User(Msg::Pong) => {
-                    self.seen_pong = true;
-                }
-                RuntimeMessage::User(Msg::Tick) | RuntimeMessage::User(Msg::Accepted) => {
-                    unreachable!("relay only processes ping and pong")
-                }
-            }
-
-            Ok(())
-        }
-    }
-
-    impl Isolate for AcceptOnce {
-        type Message = Msg;
-
-        fn handle(
-            &mut self,
-            msg: RuntimeMessage<Self::Message>,
-            effects: &mut TurnEffects<Self::Message>,
-        ) -> Result<(), RuntimeError> {
-            match msg {
-                RuntimeMessage::Init => {
-                    effects.wait_accept(7, Msg::Accepted)?;
-                }
-                RuntimeMessage::User(Msg::Accepted) => {
-                    self.accepted = true;
+                RuntimeMessage::IoCompleted(completion) if completion == self.timer => {
+                    assert_eq!(io.take_result(completion), Some(IoResult::Timer(Ok(()))));
+                    self.completed = true;
                     effects.destroy_self()?;
                 }
-                RuntimeMessage::User(Msg::Tick)
-                | RuntimeMessage::User(Msg::Ping)
-                | RuntimeMessage::User(Msg::Pong) => {
-                    unreachable!("accept-once only processes acceptance")
-                }
+                RuntimeMessage::IoCompleted(_) => {}
+                RuntimeMessage::Shutdown => effects.destroy_self()?,
             }
+            Ok(())
+        }
 
+        fn destroy(
+            &mut self,
+            _io: &mut IoContext<'_>,
+            effects: &mut TurnEffects,
+        ) -> Result<(), RuntimeError> {
+            effects.cancel(self.timer)?;
+            Ok(())
+        }
+    }
+
+    struct DestroyWhilePending {
+        completion: CompletionHandle,
+        destroyed: Rc<Cell<usize>>,
+    }
+
+    impl Isolate for DestroyWhilePending {
+        fn handle(
+            &mut self,
+            msg: RuntimeMessage,
+            io: &mut IoContext<'_>,
+            effects: &mut TurnEffects,
+        ) -> Result<(), RuntimeError> {
+            if msg == RuntimeMessage::Init {
+                self.completion = io.acquire().expect("completion capacity");
+                effects.submit(self.completion, Operation::Timer(TimerOp { ticks: 1 }))?;
+                effects.destroy_self()?;
+            }
+            Ok(())
+        }
+
+        fn destroy(
+            &mut self,
+            _io: &mut IoContext<'_>,
+            effects: &mut TurnEffects,
+        ) -> Result<(), RuntimeError> {
+            self.destroyed.set(self.destroyed.get() + 1);
+            effects.cancel(self.completion)?;
             Ok(())
         }
     }
 
     #[test]
-    fn scheduler_runs_until_isolate_destroys_itself() {
-        let mut scheduler = Scheduler::new(4, 8, 4);
-        let isolate = Countdown { remaining: 3 };
+    fn server_routes_completion_to_its_owner_and_reuses_lifecycle() {
+        let mut server = Server::new(1, 2, 2);
+        let mut io = IoLoop::new(FakeIoDriver::new(2), 2);
+        server
+            .spawn(TimerOnce {
+                timer: CompletionHandle::INVALID,
+                completed: false,
+            })
+            .unwrap();
 
-        let _handle = scheduler.spawn(isolate).unwrap();
-
-        let processed = scheduler.run_until_idle().unwrap();
-
-        assert_eq!(processed, 4);
-        assert_eq!(scheduler.isolate_count(), 0);
-        assert_eq!(scheduler.queue_len(), 0);
+        assert_eq!(server.run_until_idle(&mut io).unwrap(), 2);
+        assert_eq!(server.isolate_count(), 0);
     }
 
     #[test]
-    fn queue_capacity_applies_backpressure() {
-        let mut scheduler = Scheduler::new(1, 1, 1);
-        let isolate = Countdown { remaining: 1 };
+    fn destroying_isolate_waits_for_cancel_completion_before_release() {
+        let destroyed = Rc::new(Cell::new(0));
+        let mut server = Server::new(1, 2, 3);
+        let mut io = IoLoop::new(FakeIoDriver::new(2), 2);
+        server
+            .spawn(DestroyWhilePending {
+                completion: CompletionHandle::INVALID,
+                destroyed: Rc::clone(&destroyed),
+            })
+            .unwrap();
 
-        let handle = scheduler.spawn(isolate).unwrap();
-
-        assert_eq!(scheduler.enqueue(handle, Msg::Tick), Err(RuntimeError::QueueFull));
+        assert_eq!(server.run_until_idle(&mut io).unwrap(), 1);
+        assert_eq!(destroyed.get(), 1);
+        assert_eq!(server.isolate_count(), 0);
     }
 
     #[test]
-    fn spawn_enqueues_runtime_init_automatically() {
-        let mut scheduler = Scheduler::new(1, 4, 2);
-        let isolate = Countdown { remaining: 1 };
+    fn shutdown_uses_destroy_lifecycle_and_drops_queued_completion() {
+        let mut server = Server::new(1, 3, 2);
+        let mut io = IoLoop::new(FakeIoDriver::new(2), 2);
+        let handle = server
+            .spawn(TimerOnce {
+                timer: CompletionHandle::INVALID,
+                completed: false,
+            })
+            .unwrap();
+        server.shutdown(handle).unwrap();
 
-        let _handle = scheduler.spawn(isolate).unwrap();
-
-        assert_eq!(scheduler.run_once().unwrap(), StepResult::ProcessedOne);
-        assert_eq!(scheduler.queue_len(), 1);
-    }
-
-    #[test]
-    fn isolates_can_send_messages_to_other_isolates() {
-        let mut scheduler = Scheduler::new(4, 8, 4);
-        let left = Relay {
-            peer: None,
-            seen_ping: false,
-            seen_pong: false,
-        };
-        let right = Relay {
-            peer: None,
-            seen_ping: false,
-            seen_pong: false,
-        };
-
-        let left_handle = scheduler.spawn(left).unwrap();
-        let right_handle = scheduler.spawn(right).unwrap();
-        scheduler.isolate_mut(left_handle).unwrap().peer = Some(right_handle);
-        scheduler.isolate_mut(right_handle).unwrap().peer = Some(left_handle);
-
-        scheduler.enqueue(left_handle, Msg::Ping).unwrap();
-        scheduler.run_until_idle().unwrap();
-
-        assert_eq!(scheduler.isolate_count(), 2);
-        assert!(scheduler.isolate_mut(left_handle).unwrap().seen_ping);
-        assert!(scheduler.isolate_mut(right_handle).unwrap().seen_pong);
-    }
-
-    #[test]
-    fn fake_accept_wait_yields_and_resumes_on_future_turn() {
-        let mut scheduler = Scheduler::new(1, 4, 2);
-        let isolate = AcceptOnce { accepted: false };
-
-        let _handle = scheduler.spawn(isolate).unwrap();
-
-        let processed = scheduler.run_until_idle().unwrap();
-
-        assert_eq!(processed, 2);
-        assert_eq!(scheduler.isolate_count(), 0);
-        assert_eq!(scheduler.queue_len(), 0);
-    }
-
-    #[test]
-    fn wait_seals_the_turn_effects() {
-        let mut effects = TurnEffects::<Msg>::with_capacity(2);
-
-        effects.wait_accept(1, Msg::Accepted).unwrap();
-
-        assert_eq!(effects.send_self(Msg::Tick), Err(EffectsError::TurnSealed));
+        assert_eq!(server.run_until_idle(&mut io).unwrap(), 2);
+        assert_eq!(server.isolate_count(), 0);
     }
 }
