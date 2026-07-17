@@ -6,37 +6,58 @@ mod runtime;
 
 use completion::CompletionHandle;
 use effects::{RuntimeMessage, TurnEffects};
-use io::{FakeIoDriver, IoResult, Operation, RawFdLike, RecvOp, SendOp};
+use io::{AcceptOp, IoResult, IoUringDriver, Operation, RawFdLike, RecvOp, SendOp};
 use runtime::{IoContext, IoLoop, Isolate, RuntimeError, Server};
+use std::net::TcpListener;
+use std::os::fd::AsRawFd;
 
 enum Phase {
+    Accepting,
     Reading,
     Writing,
-    Closing,
 }
 
-struct EchoConnection {
-    fd: RawFdLike,
+struct EchoServer {
+    listener: RawFdLike,
+    connection: Option<RawFdLike>,
     phase: Phase,
+    accept: CompletionHandle,
     recv: CompletionHandle,
     send: CompletionHandle,
 }
 
-impl EchoConnection {
-    fn new(fd: RawFdLike) -> Self {
+impl EchoServer {
+    fn new(listener: RawFdLike) -> Self {
         Self {
-            fd,
-            phase: Phase::Reading,
+            listener,
+            connection: None,
+            phase: Phase::Accepting,
+            accept: CompletionHandle::INVALID,
             recv: CompletionHandle::INVALID,
             send: CompletionHandle::INVALID,
         }
+    }
+
+    fn connection_fd(&self) -> RawFdLike {
+        self.connection
+            .expect("connection phase requires an accepted socket")
+    }
+
+    fn submit_accept(&self, effects: &mut TurnEffects) -> Result<(), RuntimeError> {
+        effects.submit(
+            self.accept,
+            Operation::Accept(AcceptOp {
+                listener: self.listener,
+            }),
+        )?;
+        Ok(())
     }
 
     fn submit_recv(&self, effects: &mut TurnEffects) -> Result<(), RuntimeError> {
         effects.submit(
             self.recv,
             Operation::Recv(RecvOp {
-                fd: self.fd,
+                fd: self.connection_fd(),
                 buf: vec![0; 4096],
                 flags: 0,
             }),
@@ -48,16 +69,30 @@ impl EchoConnection {
         effects.submit(
             self.send,
             Operation::Send(SendOp {
-                fd: self.fd,
+                fd: self.connection_fd(),
                 buf,
                 flags: 0,
             }),
         )?;
         Ok(())
     }
+
+    fn close_connection(&mut self) {
+        if let Some(fd) = self.connection.take() {
+            unsafe {
+                libc::close(fd);
+            }
+        }
+    }
+
+    fn accept_next(&mut self, effects: &mut TurnEffects) -> Result<(), RuntimeError> {
+        self.close_connection();
+        self.phase = Phase::Accepting;
+        self.submit_accept(effects)
+    }
 }
 
-impl Isolate for EchoConnection {
+impl Isolate for EchoServer {
     fn handle(
         &mut self,
         msg: RuntimeMessage,
@@ -66,24 +101,46 @@ impl Isolate for EchoConnection {
     ) -> Result<(), RuntimeError> {
         match msg {
             RuntimeMessage::Init => {
+                self.accept = io.acquire().expect("completion arena full");
                 self.recv = io.acquire().expect("completion arena full");
                 self.send = io.acquire().expect("completion arena full");
-                self.submit_recv(effects)?;
+                self.submit_accept(effects)?;
+            }
+            RuntimeMessage::IoCompleted(completion) if completion == self.accept => {
+                match io.take_result(completion) {
+                    Some(IoResult::Accept(Ok(fd))) => {
+                        self.connection = Some(fd);
+                        self.phase = Phase::Reading;
+                        self.submit_recv(effects)?;
+                    }
+                    Some(IoResult::Accept(Err(error))) => {
+                        eprintln!("accept failed: {error:?}");
+                        self.submit_accept(effects)?;
+                    }
+                    Some(IoResult::Cancelled) => {}
+                    Some(_) => unreachable!("accept completion had the wrong result kind"),
+                    None => unreachable!("accept completion arrived without a result"),
+                }
             }
             RuntimeMessage::IoCompleted(completion) if completion == self.recv => {
                 match io.take_result(completion) {
                     Some(IoResult::Recv(Ok(bytes))) if bytes.is_empty() => {
-                        self.phase = Phase::Closing;
-                        effects.destroy_self()?;
+                        self.accept_next(effects)?;
                     }
                     Some(IoResult::Recv(Ok(bytes))) => {
                         self.phase = Phase::Writing;
+                        println!(
+                            "received {} bytes: {:?}",
+                            bytes.len(),
+                            String::from_utf8_lossy(&bytes)
+                        );
                         self.submit_send(bytes, effects)?;
                     }
-                    Some(IoResult::Recv(Err(_))) | Some(IoResult::Cancelled) => {
-                        self.phase = Phase::Closing;
-                        effects.destroy_self()?;
+                    Some(IoResult::Recv(Err(error))) => {
+                        eprintln!("recv failed: {error:?}");
+                        self.accept_next(effects)?;
                     }
+                    Some(IoResult::Cancelled) => {}
                     Some(_) => unreachable!("recv completion had the wrong result kind"),
                     None => unreachable!("recv completion arrived without a result"),
                 }
@@ -94,10 +151,11 @@ impl Isolate for EchoConnection {
                         self.phase = Phase::Reading;
                         self.submit_recv(effects)?;
                     }
-                    Some(IoResult::Send(Err(_))) | Some(IoResult::Cancelled) => {
-                        self.phase = Phase::Closing;
-                        effects.destroy_self()?;
+                    Some(IoResult::Send(Err(error))) => {
+                        eprintln!("send failed: {error:?}");
+                        self.accept_next(effects)?;
                     }
+                    Some(IoResult::Cancelled) => {}
                     Some(_) => unreachable!("send completion had the wrong result kind"),
                     None => unreachable!("send completion arrived without a result"),
                 }
@@ -113,6 +171,8 @@ impl Isolate for EchoConnection {
         _io: &mut IoContext<'_>,
         effects: &mut TurnEffects,
     ) -> Result<(), RuntimeError> {
+        self.close_connection();
+        effects.cancel(self.accept)?;
         effects.cancel(self.recv)?;
         effects.cancel(self.send)?;
         Ok(())
@@ -120,14 +180,19 @@ impl Isolate for EchoConnection {
 }
 
 fn main() {
-    let mut server = Server::new(16, 64, 8);
-    let mut io_loop = IoLoop::new(FakeIoDriver::new(64), 32);
+    let listener = TcpListener::bind("127.0.0.1:8080").expect("failed to bind TCP listener");
+    let mut server = Server::new(1, 8, 3);
+    let mut io_loop = IoLoop::new(IoUringDriver::new(64).expect("io_uring driver failed"), 3);
 
     server
-        .spawn(EchoConnection::new(7))
-        .expect("spawn echo connection");
-    let processed = server
-        .run_until_idle(&mut io_loop)
-        .expect("runtime should drain echo connection");
-    println!("processed {processed} isolate turns");
+        .spawn(EchoServer::new(listener.as_raw_fd()))
+        .expect("spawn echo server");
+    println!("echo server listening on 127.0.0.1:8080");
+
+    loop {
+        server
+            .step(&mut io_loop)
+            .expect("runtime should step echo server");
+        io_loop.step().expect("io loop should step");
+    }
 }

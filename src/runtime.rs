@@ -141,7 +141,10 @@ where
         op: Operation,
     ) -> Result<(), RuntimeError> {
         self.completions.submit(owner, completion)?;
-        self.driver.submit(completion, op)?;
+        if let Err(error) = self.driver.submit(completion, op) {
+            self.completions.unsubmit(owner, completion)?;
+            return Err(error.into());
+        }
         Ok(())
     }
 
@@ -262,6 +265,7 @@ where
         Ok(StepResult::ProcessedOne)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn run_until_idle<D>(&mut self, io: &mut IoLoop<D>) -> Result<usize, RuntimeError>
     where
         D: IoDriver,
@@ -392,12 +396,20 @@ where
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    #[cfg(target_os = "linux")]
+    use std::io::{Read, Write};
+    #[cfg(target_os = "linux")]
+    use std::net::{TcpListener, TcpStream};
+    #[cfg(target_os = "linux")]
+    use std::os::fd::AsRawFd;
     use std::rc::Rc;
 
     use super::{IoContext, IoLoop, Isolate, RuntimeError, Server};
     use crate::completion::CompletionHandle;
     use crate::effects::{RuntimeMessage, TurnEffects};
     use crate::io::{FakeIoDriver, IoResult, Operation, TimerOp};
+    #[cfg(target_os = "linux")]
+    use crate::io::{IoUringDriver, RecvOp, SendOp};
 
     struct TimerOnce {
         timer: CompletionHandle,
@@ -468,6 +480,88 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    struct TcpEcho {
+        fd: i32,
+        recv: CompletionHandle,
+        send: CompletionHandle,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl TcpEcho {
+        fn submit_recv(&self, effects: &mut TurnEffects) -> Result<(), RuntimeError> {
+            effects.submit(
+                self.recv,
+                Operation::Recv(RecvOp {
+                    fd: self.fd,
+                    buf: vec![0; 1024],
+                    flags: 0,
+                }),
+            )?;
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Isolate for TcpEcho {
+        fn handle(
+            &mut self,
+            message: RuntimeMessage,
+            io: &mut IoContext<'_>,
+            effects: &mut TurnEffects,
+        ) -> Result<(), RuntimeError> {
+            match message {
+                RuntimeMessage::Init => {
+                    self.recv = io.acquire().expect("recv completion capacity");
+                    self.send = io.acquire().expect("send completion capacity");
+                    self.submit_recv(effects)?;
+                }
+                RuntimeMessage::IoCompleted(completion) if completion == self.recv => {
+                    match io.take_result(completion) {
+                        Some(IoResult::Recv(Ok(bytes))) if !bytes.is_empty() => {
+                            effects.submit(
+                                self.send,
+                                Operation::Send(SendOp {
+                                    fd: self.fd,
+                                    buf: bytes,
+                                    flags: 0,
+                                }),
+                            )?;
+                        }
+                        Some(IoResult::Recv(Ok(_)))
+                        | Some(IoResult::Recv(Err(_)))
+                        | Some(IoResult::Cancelled) => effects.destroy_self()?,
+                        Some(_) => unreachable!("recv completed with the wrong result"),
+                        None => unreachable!("recv completed without a result"),
+                    }
+                }
+                RuntimeMessage::IoCompleted(completion) if completion == self.send => {
+                    match io.take_result(completion) {
+                        Some(IoResult::Send(Ok(_))) => self.submit_recv(effects)?,
+                        Some(IoResult::Send(Err(_))) | Some(IoResult::Cancelled) => {
+                            effects.destroy_self()?
+                        }
+                        Some(_) => unreachable!("send completed with the wrong result"),
+                        None => unreachable!("send completed without a result"),
+                    }
+                }
+                RuntimeMessage::IoCompleted(_) => {}
+                RuntimeMessage::Shutdown => effects.destroy_self()?,
+            }
+            Ok(())
+        }
+
+        fn destroy(
+            &mut self,
+            _io: &mut IoContext<'_>,
+            effects: &mut TurnEffects,
+        ) -> Result<(), RuntimeError> {
+            effects.cancel(self.recv)?;
+            effects.cancel(self.send)?;
+            Ok(())
+        }
+    }
+
     #[test]
     fn server_routes_completion_to_its_owner_and_reuses_lifecycle() {
         let mut server = Server::new(1, 2, 2);
@@ -513,6 +607,46 @@ mod tests {
         server.shutdown(handle).unwrap();
 
         assert_eq!(server.run_until_idle(&mut io).unwrap(), 2);
+        assert_eq!(server.isolate_count(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn io_uring_runtime_echoes_a_real_tcp_connection() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(address).unwrap();
+        let (server_socket, _) = listener.accept().unwrap();
+        let driver = match IoUringDriver::new(16) {
+            Ok(driver) => driver,
+            Err(error) if matches!(error.raw_os_error(), Some(libc::EPERM | libc::ENOSYS)) => {
+                return;
+            }
+            Err(error) => panic!("io_uring setup failed: {error}"),
+        };
+        let mut server = Server::new(1, 4, 3);
+        let mut io = IoLoop::new(driver, 2);
+        let handle = server
+            .spawn(TcpEcho {
+                fd: server_socket.as_raw_fd(),
+                recv: CompletionHandle::INVALID,
+                send: CompletionHandle::INVALID,
+            })
+            .unwrap();
+
+        client.write_all(b"echo").unwrap();
+        server.step(&mut io).unwrap();
+        assert!(io.step().unwrap());
+        server.step(&mut io).unwrap();
+        assert!(io.step().unwrap());
+        server.step(&mut io).unwrap();
+
+        let mut echoed = [0; 4];
+        client.read_exact(&mut echoed).unwrap();
+        assert_eq!(&echoed, b"echo");
+
+        server.shutdown(handle).unwrap();
+        server.run_until_idle(&mut io).unwrap();
         assert_eq!(server.isolate_count(), 0);
     }
 }

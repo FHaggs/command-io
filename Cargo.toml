@@ -4,3 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7.13"
+libc = "0.2"

@@ -11,6 +11,24 @@ impl CompletionHandle {
         index: u32::MAX,
         generation: u32::MAX,
     };
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn into_raw(self) -> u64 {
+        (u64::from(self.generation) << 32) | u64::from(self.index)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn from_raw(raw: u64) -> Self {
+        Self {
+            index: raw as u32,
+            generation: (raw >> 32) as u32,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn test_handle(index: u32, generation: u32) -> Self {
+        Self { index, generation }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,6 +132,20 @@ impl<R> CompletionArena<R> {
         }
 
         slot.state = Some(CompletionState::Submitted);
+        Ok(())
+    }
+
+    pub fn unsubmit(
+        &mut self,
+        owner: Handle,
+        completion: CompletionHandle,
+    ) -> Result<(), CompletionError> {
+        let slot = self.owned_slot_mut(owner, completion)?;
+        if slot.state != Some(CompletionState::Submitted) {
+            return Err(CompletionError::InvalidState);
+        }
+
+        slot.state = Some(CompletionState::Idle);
         Ok(())
     }
 
