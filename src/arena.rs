@@ -57,6 +57,10 @@ impl<T> Arena<T> {
         self.len
     }
 
+    pub fn capacity(&self) -> usize {
+        self.slots.len()
+    }
+
     pub fn insert(&mut self, value: T) -> Result<Handle, ArenaError> {
         let index = self.free_list.pop().ok_or(ArenaError::Full)? as usize;
         let slot = &mut self.slots[index];

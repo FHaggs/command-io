@@ -9,8 +9,7 @@ pub enum RuntimeMessage {
     Shutdown,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Effect {
+pub enum Effect<I> {
     Submit {
         completion: CompletionHandle,
         op: Operation,
@@ -18,6 +17,7 @@ pub enum Effect {
     Cancel {
         completion: CompletionHandle,
     },
+    Spawn(I),
     DestroySelf,
 }
 
@@ -26,12 +26,12 @@ pub enum EffectsError {
     Full,
 }
 
-pub struct TurnEffects {
-    effects: Vec<Effect>,
+pub struct TurnEffects<I> {
+    effects: Vec<Effect<I>>,
     max_effects: usize,
 }
 
-impl TurnEffects {
+impl<I> TurnEffects<I> {
     pub fn with_capacity(max_effects: usize) -> Self {
         Self {
             effects: Vec::with_capacity(max_effects),
@@ -55,16 +55,20 @@ impl TurnEffects {
         self.push(Effect::Cancel { completion })
     }
 
+    pub fn spawn(&mut self, isolate: I) -> Result<(), EffectsError> {
+        self.push(Effect::Spawn(isolate))
+    }
+
     pub fn destroy_self(&mut self) -> Result<(), EffectsError> {
         self.push(Effect::DestroySelf)
     }
 
-    pub fn swap_effects(&mut self, scratch: &mut Vec<Effect>) {
+    pub fn swap_effects(&mut self, scratch: &mut Vec<Effect<I>>) {
         scratch.clear();
         std::mem::swap(&mut self.effects, scratch);
     }
 
-    fn push(&mut self, effect: Effect) -> Result<(), EffectsError> {
+    fn push(&mut self, effect: Effect<I>) -> Result<(), EffectsError> {
         if self.effects.len() == self.max_effects {
             return Err(EffectsError::Full);
         }
@@ -82,7 +86,7 @@ mod tests {
 
     #[test]
     fn effects_are_bounded_and_preserve_order() {
-        let mut effects = TurnEffects::with_capacity(2);
+        let mut effects = TurnEffects::<()>::with_capacity(2);
         let completion = CompletionHandle::INVALID;
 
         effects

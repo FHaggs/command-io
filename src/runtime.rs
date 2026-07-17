@@ -64,18 +64,18 @@ impl IoContext<'_> {
     }
 }
 
-pub trait Isolate {
+pub trait Isolate: Sized {
     fn handle(
         &mut self,
         msg: RuntimeMessage,
         io: &mut IoContext<'_>,
-        effects: &mut TurnEffects,
+        effects: &mut TurnEffects<Self>,
     ) -> Result<(), RuntimeError>;
 
     fn destroy(
         &mut self,
         io: &mut IoContext<'_>,
-        effects: &mut TurnEffects,
+        effects: &mut TurnEffects<Self>,
     ) -> Result<(), RuntimeError>;
 }
 
@@ -186,8 +186,8 @@ where
     arena: Arena<IsolateSlot<I>>,
     queue: VecDeque<Envelope>,
     queue_capacity: usize,
-    effects: TurnEffects,
-    effect_scratch: Vec<Effect>,
+    effects: TurnEffects<I>,
+    effect_scratch: Vec<Effect<I>>,
     destroying: Vec<Handle>,
 }
 
@@ -328,8 +328,19 @@ where
             .iter()
             .filter(|effect| matches!(effect, Effect::Submit { .. }))
             .count();
+        let spawn_count = self
+            .effect_scratch
+            .iter()
+            .filter(|effect| matches!(effect, Effect::Spawn(_)))
+            .count();
         if !io.driver.can_submit(submit_count) {
             return Err(RuntimeError::Io(IoError::DriverFull));
+        }
+        if self.arena.len().saturating_add(spawn_count) > self.arena.capacity() {
+            return Err(RuntimeError::Arena(ArenaError::Full));
+        }
+        if self.queue.len().saturating_add(spawn_count) > self.queue_capacity {
+            return Err(RuntimeError::QueueFull);
         }
 
         let mut destroy_requested = false;
@@ -337,6 +348,16 @@ where
             match effect {
                 Effect::Submit { completion, op } => io.submit(owner, completion, op)?,
                 Effect::Cancel { completion } => io.cancel(owner, completion)?,
+                Effect::Spawn(isolate) => {
+                    let handle = self.arena.insert(IsolateSlot {
+                        isolate,
+                        destroying: false,
+                    })?;
+                    self.queue.push_back(Envelope {
+                        target: handle,
+                        message: RuntimeMessage::Init,
+                    });
+                }
                 Effect::DestroySelf => destroy_requested = true,
             }
         }
@@ -421,7 +442,7 @@ mod tests {
             &mut self,
             msg: RuntimeMessage,
             io: &mut IoContext<'_>,
-            effects: &mut TurnEffects,
+            effects: &mut TurnEffects<Self>,
         ) -> Result<(), RuntimeError> {
             match msg {
                 RuntimeMessage::Init => {
@@ -442,7 +463,7 @@ mod tests {
         fn destroy(
             &mut self,
             _io: &mut IoContext<'_>,
-            effects: &mut TurnEffects,
+            effects: &mut TurnEffects<Self>,
         ) -> Result<(), RuntimeError> {
             effects.cancel(self.timer)?;
             Ok(())
@@ -459,7 +480,7 @@ mod tests {
             &mut self,
             msg: RuntimeMessage,
             io: &mut IoContext<'_>,
-            effects: &mut TurnEffects,
+            effects: &mut TurnEffects<Self>,
         ) -> Result<(), RuntimeError> {
             if msg == RuntimeMessage::Init {
                 self.completion = io.acquire().expect("completion capacity");
@@ -472,10 +493,46 @@ mod tests {
         fn destroy(
             &mut self,
             _io: &mut IoContext<'_>,
-            effects: &mut TurnEffects,
+            effects: &mut TurnEffects<Self>,
         ) -> Result<(), RuntimeError> {
             self.destroyed.set(self.destroyed.get() + 1);
             effects.cancel(self.completion)?;
+            Ok(())
+        }
+    }
+
+    struct SpawnParent {
+        child_initialized: Rc<Cell<bool>>,
+        is_parent: bool,
+    }
+
+    impl Isolate for SpawnParent {
+        fn handle(
+            &mut self,
+            msg: RuntimeMessage,
+            _io: &mut IoContext<'_>,
+            effects: &mut TurnEffects<Self>,
+        ) -> Result<(), RuntimeError> {
+            if msg == RuntimeMessage::Init && self.is_parent {
+                effects.spawn(Self {
+                    child_initialized: Rc::clone(&self.child_initialized),
+                    is_parent: false,
+                })?;
+                effects.destroy_self()?;
+            } else if msg == RuntimeMessage::Init {
+                self.child_initialized.set(true);
+                effects.destroy_self()?;
+            } else if msg == RuntimeMessage::Shutdown {
+                effects.destroy_self()?;
+            }
+            Ok(())
+        }
+
+        fn destroy(
+            &mut self,
+            _io: &mut IoContext<'_>,
+            _effects: &mut TurnEffects<Self>,
+        ) -> Result<(), RuntimeError> {
             Ok(())
         }
     }
@@ -489,7 +546,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     impl TcpEcho {
-        fn submit_recv(&self, effects: &mut TurnEffects) -> Result<(), RuntimeError> {
+        fn submit_recv(&self, effects: &mut TurnEffects<Self>) -> Result<(), RuntimeError> {
             effects.submit(
                 self.recv,
                 Operation::Recv(RecvOp {
@@ -508,7 +565,7 @@ mod tests {
             &mut self,
             message: RuntimeMessage,
             io: &mut IoContext<'_>,
-            effects: &mut TurnEffects,
+            effects: &mut TurnEffects<Self>,
         ) -> Result<(), RuntimeError> {
             match message {
                 RuntimeMessage::Init => {
@@ -554,7 +611,7 @@ mod tests {
         fn destroy(
             &mut self,
             _io: &mut IoContext<'_>,
-            effects: &mut TurnEffects,
+            effects: &mut TurnEffects<Self>,
         ) -> Result<(), RuntimeError> {
             effects.cancel(self.recv)?;
             effects.cancel(self.send)?;
@@ -591,6 +648,33 @@ mod tests {
 
         assert_eq!(server.run_until_idle(&mut io).unwrap(), 1);
         assert_eq!(destroyed.get(), 1);
+        assert_eq!(server.isolate_count(), 0);
+    }
+
+    #[test]
+    fn spawn_effect_initializes_a_child_on_a_later_turn() {
+        let child_initialized = Rc::new(Cell::new(false));
+        let mut server = Server::new(2, 2, 2);
+        let mut io = IoLoop::new(FakeIoDriver::new(0), 0);
+        server
+            .spawn(SpawnParent {
+                child_initialized: Rc::clone(&child_initialized),
+                is_parent: true,
+            })
+            .unwrap();
+
+        assert_eq!(
+            server.step(&mut io).unwrap(),
+            super::StepResult::ProcessedOne
+        );
+        assert!(!child_initialized.get());
+        assert_eq!(server.isolate_count(), 1);
+
+        assert_eq!(
+            server.step(&mut io).unwrap(),
+            super::StepResult::ProcessedOne
+        );
+        assert!(child_initialized.get());
         assert_eq!(server.isolate_count(), 0);
     }
 
