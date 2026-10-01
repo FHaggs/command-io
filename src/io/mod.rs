@@ -1,457 +1,321 @@
+//! Explicit, nonblocking I/O stepping on top of io_uring.
+//!
+//! `IoContext::submit` only queues an SQE. `IoContext::step` flushes queued
+//! SQEs, retires the CQEs that are already available, marks their slots
+//! `Ready`, and pushes their handles onto a bounded ready queue. Nothing here
+//! advances application state; owners consume ready results on their own turn.
+
 use std::collections::VecDeque;
-use std::os::fd::RawFd;
+use std::io;
+use std::os::unix::io::AsRawFd;
 
-use crate::completion::CompletionHandle;
+use io_uring::squeue::Entry;
+use io_uring::{IoUring, opcode, types::Fd};
 
-pub type RawFdLike = RawFd;
+use crate::completion::{
+    CompletionArena, CompletionError, CompletionHandle, CompletionState, OwnerHandle, ReadOp,
+};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AcceptOp {
-    pub listener: RawFdLike,
+/// Translates submissions to SQEs and CQEs to `(user_data, result)` pairs.
+pub struct IoEngine {
+    ring: IoUring,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RecvOp {
-    pub fd: RawFdLike,
-    pub buf: Vec<u8>,
-    pub flags: i32,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SendOp {
-    pub fd: RawFdLike,
-    pub buf: Vec<u8>,
-    pub flags: i32,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TimerOp {
-    pub ticks: u32,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum Operation {
-    Accept(AcceptOp),
-    Recv(RecvOp),
-    Send(SendOp),
-    Timer(TimerOp),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
-pub enum IoError {
-    DriverFull,
-    CompletionQueueFull,
-    UnknownCompletion,
-    Unsupported,
-    System(i32),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum IoResult {
-    Accept(Result<RawFdLike, IoError>),
-    Recv(Result<Vec<u8>, IoError>),
-    Send(Result<usize, IoError>),
-    Timer(Result<(), IoError>),
-    Cancelled,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DriverCompletion {
-    pub completion: CompletionHandle,
-    pub result: IoResult,
-}
-
-pub trait IoDriver {
-    fn can_submit(&self, additional: usize) -> bool;
-
-    fn submit(&mut self, completion: CompletionHandle, op: Operation) -> Result<(), IoError>;
-
-    fn cancel(&mut self, completion: CompletionHandle) -> Result<(), IoError>;
-
-    fn step(
-        &mut self,
-        max_completions: usize,
-        completed: &mut Vec<DriverCompletion>,
-    ) -> Result<bool, IoError>;
-
-    fn has_pending(&self) -> bool;
-}
-
-struct PendingOperation {
-    completion: CompletionHandle,
-    op: Operation,
-    cancelled: bool,
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub struct FakeIoDriver {
-    pending: VecDeque<PendingOperation>,
-    capacity: usize,
-}
-
-#[cfg(target_os = "linux")]
-#[cfg_attr(not(test), allow(dead_code))]
-const CANCEL_USER_DATA: u64 = u64::MAX;
-
-#[cfg(target_os = "linux")]
-#[cfg_attr(not(test), allow(dead_code))]
-pub struct IoUringDriver {
-    ring: io_uring::IoUring,
-    pending: Vec<PendingOperation>,
-    cqe_scratch: VecDeque<(u64, i32)>,
-    capacity: usize,
-}
-
-#[cfg(target_os = "linux")]
-#[cfg_attr(not(test), allow(dead_code))]
-impl IoUringDriver {
-    pub fn new(entries: u32) -> std::io::Result<Self> {
+impl IoEngine {
+    pub fn new(entries: u32) -> io::Result<Self> {
         Ok(Self {
-            ring: io_uring::IoUring::new(entries)?,
-            pending: Vec::with_capacity(entries as usize),
-            cqe_scratch: VecDeque::with_capacity(entries as usize),
-            capacity: entries as usize,
+            ring: IoUring::new(entries)?,
         })
     }
 
-    fn push_entry(&mut self, entry: io_uring::squeue::Entry) -> Result<(), IoError> {
-        unsafe {
-            self.ring
-                .submission()
-                .push(&entry)
-                .map_err(|_| IoError::DriverFull)
-        }
+    /// Queues an SQE without entering the kernel.
+    ///
+    /// # Safety
+    /// Every resource referenced by `entry` must stay valid until its CQE has
+    /// been retired.
+    unsafe fn push(&mut self, entry: &Entry) -> Result<(), CompletionError> {
+        unsafe { self.ring.submission().push(entry) }.map_err(|_| CompletionError::Full)
     }
 
-    fn completion_result(pending: PendingOperation, result: i32) -> IoResult {
-        if result == -libc::ECANCELED {
-            return IoResult::Cancelled;
-        }
-
-        match pending.op {
-            Operation::Accept(_) => IoResult::Accept(if result >= 0 {
-                Ok(result)
-            } else {
-                Err(IoError::System(-result))
-            }),
-            Operation::Recv(mut op) => IoResult::Recv(if result >= 0 {
-                op.buf.truncate(result as usize);
-                Ok(op.buf)
-            } else {
-                Err(IoError::System(-result))
-            }),
-            Operation::Send(_) => IoResult::Send(if result >= 0 {
-                Ok(result as usize)
-            } else {
-                Err(IoError::System(-result))
-            }),
-            Operation::Timer(_) => IoResult::Timer(Err(IoError::Unsupported)),
-        }
+    /// Hands queued SQEs to the kernel without waiting for completions.
+    fn flush(&mut self) -> io::Result<usize> {
+        self.ring.submit()
     }
 
-    fn drain_cqes(
-        &mut self,
-        max_completions: usize,
-        completed: &mut Vec<DriverCompletion>,
-    ) -> Result<bool, IoError> {
-        let mut progressed = false;
-        while completed.len() < max_completions && completed.len() < completed.capacity() {
-            let Some((user_data, result)) = self.cqe_scratch.pop_front() else {
-                break;
-            };
-            let completion = CompletionHandle::from_raw(user_data);
-            let index = self
-                .pending
-                .iter()
-                .position(|pending| pending.completion == completion)
-                .ok_or(IoError::UnknownCompletion)?;
-            let pending = self.pending.swap_remove(index);
-            completed.push(DriverCompletion {
-                completion,
-                result: Self::completion_result(pending, result),
-            });
-            progressed = true;
+    /// Blocks until at least `want` CQEs are available. Only used on teardown.
+    fn wait(&mut self, want: usize) -> io::Result<usize> {
+        self.ring.submit_and_wait(want)
+    }
+
+    /// Retires at most `limit` currently available CQEs.
+    fn drain(&mut self, limit: usize, mut on_cqe: impl FnMut(u64, i32)) -> usize {
+        let mut retired = 0;
+        for cqe in self.ring.completion().take(limit) {
+            on_cqe(cqe.user_data(), cqe.result());
+            retired += 1;
         }
-        Ok(progressed)
+        retired
     }
 }
 
-#[cfg(target_os = "linux")]
-impl IoDriver for IoUringDriver {
-    fn can_submit(&self, additional: usize) -> bool {
-        self.pending.len().saturating_add(additional) <= self.capacity
+pub struct IoContext {
+    engine: IoEngine,
+    completions: CompletionArena,
+    ready: VecDeque<CompletionHandle>,
+    ready_capacity: usize,
+    in_flight: usize,
+}
+
+impl IoContext {
+    /// Creates a context with `capacity` completion slots. The ring is sized
+    /// so that every slot can be in flight at once without SQ/CQ overflow.
+    pub fn new(capacity: u32) -> io::Result<Self> {
+        let capacity = capacity.max(1);
+        Ok(Self {
+            engine: IoEngine::new(capacity.next_power_of_two())?,
+            completions: CompletionArena::with_capacity(capacity as usize),
+            ready: VecDeque::with_capacity(capacity as usize),
+            ready_capacity: capacity as usize,
+            in_flight: 0,
+        })
     }
 
-    fn submit(&mut self, completion: CompletionHandle, op: Operation) -> Result<(), IoError> {
-        if !self.can_submit(1) {
-            return Err(IoError::DriverFull);
-        }
-        if matches!(op, Operation::Timer(_)) {
-            return Err(IoError::Unsupported);
-        }
+    pub fn acquire(&mut self, owner: OwnerHandle) -> Result<CompletionHandle, CompletionError> {
+        self.completions.acquire(owner)
+    }
 
-        self.pending.push(PendingOperation {
-            completion,
-            op,
-            cancelled: false,
-        });
-        let pending = self.pending.last().expect("operation was just inserted");
-        let user_data = completion.into_raw();
-        let entry = match &pending.op {
-            Operation::Accept(op) => io_uring::opcode::Accept::new(
-                io_uring::types::Fd(op.listener),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-            .build()
-            .user_data(user_data),
-            Operation::Recv(op) => io_uring::opcode::Recv::new(
-                io_uring::types::Fd(op.fd),
-                op.buf.as_ptr().cast_mut(),
-                op.buf.len() as u32,
-            )
-            .flags(op.flags)
-            .build()
-            .user_data(user_data),
-            Operation::Send(op) => io_uring::opcode::Send::new(
-                io_uring::types::Fd(op.fd),
-                op.buf.as_ptr(),
-                op.buf.len() as u32,
-            )
-            .flags(op.flags)
-            .build()
-            .user_data(user_data),
-            Operation::Timer(_) => unreachable!("timer was rejected before submission"),
-        };
+    pub fn release(
+        &mut self,
+        owner: OwnerHandle,
+        completion: CompletionHandle,
+    ) -> Result<Option<ReadOp>, CompletionError> {
+        self.completions.release(owner, completion)
+    }
 
-        if let Err(error) = self.push_entry(entry) {
-            let _ = self.pending.pop();
-            return Err(error);
+    pub fn prepare_read(
+        &mut self,
+        owner: OwnerHandle,
+        completion: CompletionHandle,
+        op: ReadOp,
+    ) -> Result<Option<ReadOp>, CompletionError> {
+        self.completions.prepare_read(owner, completion, op)
+    }
+
+    pub fn read_op(
+        &self,
+        owner: OwnerHandle,
+        completion: CompletionHandle,
+    ) -> Result<&ReadOp, CompletionError> {
+        self.completions.read_op(owner, completion)
+    }
+
+    pub fn owner(&self, completion: CompletionHandle) -> Result<OwnerHandle, CompletionError> {
+        self.completions.owner(completion)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn state(&self, completion: CompletionHandle) -> Result<CompletionState, CompletionError> {
+        self.completions.state(completion)
+    }
+
+    pub fn take_result(
+        &mut self,
+        owner: OwnerHandle,
+        completion: CompletionHandle,
+    ) -> Result<io::Result<usize>, CompletionError> {
+        self.completions.take_result(owner, completion)
+    }
+
+    /// Verifies ownership and `Idle`, marks the slot `Submitted`, and queues
+    /// its SQE. The kernel does not see it until the next [`Self::step`].
+    pub fn submit(
+        &mut self,
+        owner: OwnerHandle,
+        completion: CompletionHandle,
+    ) -> Result<(), CompletionError> {
+        let op = self.completions.begin_submit(owner, completion)?;
+        let len = u32::try_from(op.buf.len()).unwrap_or(u32::MAX);
+        let entry = opcode::Read::new(Fd(op.file.as_raw_fd()), op.buf.as_mut_ptr(), len)
+            .offset(op.offset)
+            .build()
+            .user_data(completion.into_raw());
+
+        // SAFETY: the file and buffer are owned by the slot, whose heap storage
+        // never moves, and the slot cannot be released or re-prepared while
+        // `Submitted`. Drop waits for in-flight operations before freeing them.
+        if let Err(err) = unsafe { self.engine.push(&entry) } {
+            self.completions.abort_submit(completion);
+            return Err(err);
         }
+        self.in_flight += 1;
         Ok(())
     }
 
-    fn cancel(&mut self, completion: CompletionHandle) -> Result<(), IoError> {
-        let pending = self
-            .pending
-            .iter_mut()
-            .find(|pending| pending.completion == completion)
-            .ok_or(IoError::UnknownCompletion)?;
-        if pending.cancelled {
-            return Ok(());
-        }
-        pending.cancelled = true;
-
-        self.push_entry(
-            io_uring::opcode::AsyncCancel::new(completion.into_raw())
-                .build()
-                .user_data(CANCEL_USER_DATA),
-        )
+    /// Flushes queued SQEs and retires available CQEs without blocking.
+    /// Returns the number of completions that became `Ready`.
+    pub fn step(&mut self) -> io::Result<usize> {
+        self.engine.flush()?;
+        Ok(self.retire_available())
     }
 
-    fn step(
-        &mut self,
-        max_completions: usize,
-        completed: &mut Vec<DriverCompletion>,
-    ) -> Result<bool, IoError> {
-        if max_completions == 0 {
-            return Ok(false);
-        }
-
-        let progressed = self.drain_cqes(max_completions, completed)?;
-        if completed.len() == max_completions || completed.len() == completed.capacity() {
-            return Ok(progressed);
-        }
-        if self.pending.is_empty() {
-            return Ok(progressed);
-        }
-
-        self.ring
-            .submit_and_wait(1)
-            .map_err(|error| IoError::System(error.raw_os_error().unwrap_or(libc::EIO)))?;
-
-        {
-            let mut completion_queue = self.ring.completion();
-            for cqe in &mut completion_queue {
-                if cqe.user_data() == CANCEL_USER_DATA {
-                    continue;
-                }
-                debug_assert!(self.cqe_scratch.len() < self.cqe_scratch.capacity());
-                self.cqe_scratch.push_back((cqe.user_data(), cqe.result()));
+    /// Pops the next ready completion. Handles whose slot is no longer
+    /// `Ready` (already consumed or released) are skipped.
+    pub fn pop_ready(&mut self) -> Option<CompletionHandle> {
+        while let Some(handle) = self.ready.pop_front() {
+            if self.completions.state(handle) == Ok(CompletionState::Ready) {
+                return Some(handle);
             }
         }
-
-        Ok(self.drain_cqes(max_completions, completed)? || progressed)
+        None
     }
 
-    fn has_pending(&self) -> bool {
-        !self.pending.is_empty()
-    }
-}
+    fn retire_available(&mut self) -> usize {
+        // Never retire more CQEs than the ready queue can hold; the rest stay
+        // in the CQ until the next step.
+        let room = self.ready_capacity - self.ready.len();
+        let Self {
+            engine,
+            completions,
+            ready,
+            in_flight,
+            ..
+        } = self;
 
-#[cfg_attr(not(test), allow(dead_code))]
-impl FakeIoDriver {
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            pending: VecDeque::with_capacity(capacity),
-            capacity,
-        }
-    }
-}
-
-impl IoDriver for FakeIoDriver {
-    fn can_submit(&self, additional: usize) -> bool {
-        self.pending.len().saturating_add(additional) <= self.capacity
-    }
-
-    fn submit(&mut self, completion: CompletionHandle, op: Operation) -> Result<(), IoError> {
-        if !self.can_submit(1) {
-            return Err(IoError::DriverFull);
-        }
-
-        self.pending.push_back(PendingOperation {
-            completion,
-            op,
-            cancelled: false,
-        });
-        Ok(())
-    }
-
-    fn cancel(&mut self, completion: CompletionHandle) -> Result<(), IoError> {
-        let pending = self
-            .pending
-            .iter_mut()
-            .find(|pending| pending.completion == completion)
-            .ok_or(IoError::UnknownCompletion)?;
-        pending.cancelled = true;
-        Ok(())
-    }
-
-    fn step(
-        &mut self,
-        max_completions: usize,
-        completed: &mut Vec<DriverCompletion>,
-    ) -> Result<bool, IoError> {
-        let pending_len = self.pending.len().min(max_completions);
-        let mut progressed = false;
-
-        for _ in 0..pending_len {
-            if completed.len() == completed.capacity() {
-                return Err(IoError::CompletionQueueFull);
-            }
-
-            let pending = self
-                .pending
-                .pop_front()
-                .expect("pending length was measured");
-            let result = if pending.cancelled {
-                IoResult::Cancelled
+        let mut became_ready = 0;
+        engine.drain(room, |user_data, res| {
+            let handle = CompletionHandle::from_raw(user_data);
+            let result = if res < 0 {
+                Err(io::Error::from_raw_os_error(-res))
             } else {
-                complete_fake_operation(pending.op)
+                Ok(res as usize)
             };
-            completed.push(DriverCompletion {
-                completion: pending.completion,
-                result,
-            });
-            progressed = true;
-        }
-
-        Ok(progressed)
-    }
-
-    fn has_pending(&self) -> bool {
-        !self.pending.is_empty()
+            *in_flight -= 1;
+            // A stale or unexpected handle is rejected rather than delivered.
+            if completions.complete(handle, result).is_ok() {
+                ready.push_back(handle);
+                became_ready += 1;
+            }
+        });
+        became_ready
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-fn complete_fake_operation(op: Operation) -> IoResult {
-    match op {
-        Operation::Accept(AcceptOp { listener }) => IoResult::Accept(Ok(listener)),
-        Operation::Recv(RecvOp { .. }) => IoResult::Recv(Ok(Vec::new())),
-        Operation::Send(SendOp { buf, .. }) => IoResult::Send(Ok(buf.len())),
-        Operation::Timer(TimerOp { .. }) => IoResult::Timer(Ok(())),
+impl Drop for IoContext {
+    fn drop(&mut self) {
+        // The kernel may still write into slot buffers; they must outlive
+        // every in-flight operation.
+        while self.in_flight > 0 {
+            self.ready.clear();
+            if self.engine.wait(1).is_err() && self.retire_available() == 0 {
+                // Cannot confirm the kernel is done: leak the resources rather
+                // than free memory it might still write to.
+                let completions =
+                    std::mem::replace(&mut self.completions, CompletionArena::with_capacity(0));
+                std::mem::forget(completions);
+                return;
+            }
+            self.retire_available();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{FakeIoDriver, IoDriver, IoResult, Operation, TimerOp};
-    use crate::completion::CompletionHandle;
+    use super::*;
+    use std::fs::File;
 
-    #[test]
-    fn fake_driver_reaps_submitted_operation_by_completion() {
-        let mut driver = FakeIoDriver::new(1);
-        let completion = CompletionHandle::INVALID;
-        let mut completed = Vec::with_capacity(1);
+    const A: OwnerHandle = OwnerHandle(1);
+    const B: OwnerHandle = OwnerHandle(2);
 
-        driver
-            .submit(completion, Operation::Timer(TimerOp { ticks: 1 }))
-            .unwrap();
-        assert!(driver.step(1, &mut completed).unwrap());
-        assert_eq!(completed.len(), 1);
-        assert_eq!(completed[0].completion, completion);
-        assert_eq!(completed[0].result, IoResult::Timer(Ok(())));
+    /// Steps until `count` completions are ready, bounded to avoid hanging.
+    fn step_until_ready(io: &mut IoContext, count: usize) -> Vec<CompletionHandle> {
+        let mut ready = Vec::new();
+        for _ in 0..1_000_000 {
+            io.step().unwrap();
+            while let Some(handle) = io.pop_ready() {
+                ready.push(handle);
+            }
+            if ready.len() >= count {
+                return ready;
+            }
+        }
+        panic!("completions never became ready");
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn io_uring_driver_echoes_through_a_real_tcp_socket() {
-        use std::io::{Read, Write};
-        use std::net::{TcpListener, TcpStream};
-        use std::os::fd::AsRawFd;
+    fn cqe_result_is_stored_in_slot_selected_by_user_data() {
+        let mut io = IoContext::new(4).unwrap();
+        let cargo = io.acquire(A).unwrap();
+        let readme = io.acquire(B).unwrap();
+        io.prepare_read(
+            A,
+            cargo,
+            ReadOp::new(File::open("Cargo.toml").unwrap(), 4096),
+        )
+        .unwrap();
+        io.prepare_read(
+            B,
+            readme,
+            ReadOp::new(File::open("README.md").unwrap(), 4096),
+        )
+        .unwrap();
+        io.submit(A, cargo).unwrap();
+        io.submit(B, readme).unwrap();
 
-        use super::{IoUringDriver, RecvOp, SendOp};
+        let ready = step_until_ready(&mut io, 2);
+        assert!(ready.contains(&cargo) && ready.contains(&readme));
+        assert_eq!(io.owner(cargo), Ok(A));
+        assert_eq!(io.owner(readme), Ok(B));
 
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let address = listener.local_addr().unwrap();
-        let mut client = TcpStream::connect(address).unwrap();
-        let (server, _) = listener.accept().unwrap();
-        let mut driver = match IoUringDriver::new(8) {
-            Ok(driver) => driver,
-            Err(error) if matches!(error.raw_os_error(), Some(libc::EPERM | libc::ENOSYS)) => {
-                return;
-            }
-            Err(error) => panic!("io_uring setup failed: {error}"),
-        };
-        let completion = CompletionHandle::test_handle(0, 0);
-        let mut completed = Vec::with_capacity(1);
+        let n = io.take_result(A, cargo).unwrap().unwrap();
+        assert!(io.read_op(A, cargo).unwrap().buf[..n].starts_with(b"[package]"));
+        let n = io.take_result(B, readme).unwrap().unwrap();
+        assert!(io.read_op(B, readme).unwrap().buf[..n].starts_with(b"# command-io"));
+    }
 
-        client.write_all(b"ping").unwrap();
-        driver
-            .submit(
-                completion,
-                Operation::Recv(RecvOp {
-                    fd: server.as_raw_fd(),
-                    buf: vec![0; 16],
-                    flags: 0,
-                }),
-            )
+    #[test]
+    fn successful_result_resets_slot_to_idle_and_can_be_reused() {
+        let mut io = IoContext::new(1).unwrap();
+        let handle = io.acquire(A).unwrap();
+        io.prepare_read(A, handle, ReadOp::new(File::open("Cargo.toml").unwrap(), 8))
             .unwrap();
-        assert!(driver.step(1, &mut completed).unwrap());
-        let bytes = match completed.pop().unwrap().result {
-            IoResult::Recv(Ok(bytes)) => bytes,
-            other => panic!("recv failed: {other:?}"),
-        };
-        assert_eq!(bytes, b"ping");
 
-        driver
-            .submit(
-                completion,
-                Operation::Send(SendOp {
-                    fd: server.as_raw_fd(),
-                    buf: bytes,
-                    flags: 0,
-                }),
-            )
+        for _ in 0..2 {
+            io.submit(A, handle).unwrap();
+            assert_eq!(io.state(handle), Ok(CompletionState::Submitted));
+            step_until_ready(&mut io, 1);
+            assert_eq!(io.take_result(A, handle).unwrap().unwrap(), 8);
+            assert_eq!(io.state(handle), Ok(CompletionState::Idle));
+        }
+    }
+
+    #[test]
+    fn negative_cqe_becomes_ready_error_for_same_owner() {
+        let mut io = IoContext::new(1).unwrap();
+        let handle = io.acquire(A).unwrap();
+        // Reading a directory fails with EISDIR.
+        io.prepare_read(A, handle, ReadOp::new(File::open("src").unwrap(), 64))
             .unwrap();
-        assert!(driver.step(1, &mut completed).unwrap());
-        assert_eq!(completed.pop().unwrap().result, IoResult::Send(Ok(4)));
+        io.submit(A, handle).unwrap();
 
-        let mut echoed = [0; 4];
-        client.read_exact(&mut echoed).unwrap();
-        assert_eq!(&echoed, b"ping");
+        let ready = step_until_ready(&mut io, 1);
+        assert_eq!(ready, vec![handle]);
+        assert_eq!(io.owner(handle), Ok(A));
+        let err = io.take_result(A, handle).unwrap().unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EISDIR));
+    }
+
+    #[test]
+    fn drop_with_operation_in_flight_waits_for_kernel() {
+        let mut io = IoContext::new(1).unwrap();
+        let handle = io.acquire(A).unwrap();
+        io.prepare_read(
+            A,
+            handle,
+            ReadOp::new(File::open("Cargo.toml").unwrap(), 4096),
+        )
+        .unwrap();
+        io.submit(A, handle).unwrap();
+        drop(io);
     }
 }
